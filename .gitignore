@@ -12,9 +12,11 @@ log/
 tb*/
 img*/
 local_output*
+*.npz
 *.pth
+*.pb
 *.pth.tar
 *.ckpt
 *.log
 *.txt
-*.ipynb
+*.png

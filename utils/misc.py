@@ -1,3 +1,5 @@
+# pylint: skip-file
+
 import datetime
 import functools
 import glob
@@ -12,6 +14,7 @@ import numpy as np
 import pytz
 import torch
 import torch.distributed as tdist
+from torch.utils.tensorboard import SummaryWriter
 
 import dist
 from utils import arg_util
@@ -126,9 +129,6 @@ class DistLogger(object):
 
 class TensorboardLogger(object):
     def __init__(self, log_dir, filename_suffix):
-        try: import tensorflow_io as tfio
-        except: pass
-        from torch.utils.tensorboard import SummaryWriter
         self.writer = SummaryWriter(log_dir=log_dir, filename_suffix=filename_suffix)
         self.step = 0
     
