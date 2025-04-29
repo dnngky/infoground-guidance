@@ -1,8 +1,11 @@
+# pylint: skip-file
+
 import math
 from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as func
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
@@ -115,7 +118,7 @@ class VAR(nn.Module):
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
-    def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
+    def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]) -> torch.Tensor:
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual   # fused_add_norm must be used
             h = resi + self.blocks[-1].drop_path(h)
@@ -125,23 +128,37 @@ class VAR(nn.Module):
     
     @torch.no_grad()
     def autoregressive_infer_cfg(
-        self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
-        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
-        more_smooth=False,
+        self,
+        B: int,
+        label_B: Optional[Union[int, torch.LongTensor]],
+        g_seed: Optional[int] = None,
+        cfg: int | float | list[torch.Tensor] = 1.5,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        use_attn: bool = False,
+        more_smooth: bool = False,
+        return_all_scales: bool = False
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
+
         :param B: batch size
         :param label_B: imagenet label; if None, randomly sampled
         :param g_seed: random seed
         :param cfg: classifier-free guidance ratio
         :param top_k: top-k sampling
         :param top_p: top-p sampling
+        :param use_attn: perform self-attention on logits
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :param return_all_scales: return the image produced at every scale
+
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
-        if g_seed is None: rng = None
-        else: self.rng.manual_seed(g_seed); rng = self.rng
+        if g_seed is None:
+            rng = None
+        else:
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
         
         if label_B is None:
             label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
@@ -149,45 +166,98 @@ class VAR(nn.Module):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        # print(f"{len(label_B) = }")
+        # print(f"{cond_BD.shape = }")
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        # print(f"{self.lvl_embed.weight.data.shape = }, {self.lvl_1L.shape = }, {self.pos_1LC.shape = }")
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
-        for b in self.blocks: b.attn.kv_caching(True)
+        imgs = [] # image at different scales
+        
+        # Enable kv-caching
+        for b in self.blocks:
+            b.attn.kv_caching(True)
+        
+        # prev_nudge_logits = None
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-            ratio = si / self.num_stages_minus_1
-            # last_L = cur_L
-            cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+
+            cur_L += pn**2
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            AdaLNSelfAttn.forward
+
+            # Forward pass
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+
             logits_BlV = self.get_logits(x, cond_BD)
-            
-            t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
+            cond_logits, uncond_logits = logits_BlV[:B], logits_BlV[B:]
+            nudge_logits = cond_logits - uncond_logits
+            ratio = si / self.num_stages_minus_1
+
+            if use_attn:
+                # Self-attention
+                nudge_logits = func.scaled_dot_product_attention(
+                    query=nudge_logits,
+                    key=nudge_logits,
+                    value=nudge_logits,
+                )
+                # Cross-attention
+                # if si > 0:
+                #     cross_logits = func.scaled_dot_product_attention(
+                #         query=nudge_logits,
+                #         key=prev_nudge_logits,
+                #         value=prev_nudge_logits
+                #     )
+                #     nudge_logits += ratio * cross_logits
+                # prev_nudge_logits = nudge_logits
+
+            if isinstance(cfg, (int, float)):
+                t = ratio * cfg
+                w = 1 + t
+                """
+                logits_BlV = (1 + t) * cond_logits - t * uncond_logits
+                           = w * cond_logits - (w - 1) * uncond_logits
+                           = w * cond_logits - w * uncond_logits + uncond_logits
+                           = uncond_logits + w * (cond_logits - uncond_logits)
+                """
+                logits_BlV = uncond_logits + w * nudge_logits
+            else:
+                # custom guidance
+                w = cfg[si].to(logits_BlV.get_device())
+                logits_BlV = uncond_logits + w @ nudge_logits
+
+            # print(f"{w_ll.shape = }, {logits_BlV.shape[1:] = }")
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            # print(f"{idx_Bl.shape = }")
             if not more_smooth: # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
+
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            # print(f"{h_BChw.shape = }")
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, len(self.patch_nums), f_hat, h_BChw
+            )
+            imgs.append(self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)) # de-normalize, from [-1, 1] to [0, 1]
+            # print(f"{next_token_map.shape = }")
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                # print(f"{next_token_map.shape = }")
+                # print(next_token_map[0])
                 next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
         
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        
+        if not return_all_scales:
+            return imgs[-1] # return final image only
+        return torch.stack(imgs).squeeze()
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """

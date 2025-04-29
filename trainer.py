@@ -1,3 +1,5 @@
+# pylint: skip-file
+
 import time
 from typing import List, Optional, Tuple, Union
 
@@ -88,7 +90,7 @@ class VARTrainer(object):
         inp_B3HW: FTen, label_B: Union[ITen, FTen], prog_si: int, prog_wp_it: float,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # if progressive training
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
+        self.var_wo_ddp.prog_train_si = self.vae_local.quantize.prog_si = prog_si
         if self.last_prog_si != prog_si:
             if self.last_prog_si != -1: self.first_prog = False
             self.last_prog_si = prog_si
@@ -156,7 +158,7 @@ class VARTrainer(object):
                 tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
                 tb_lg.update(head='AR_iter_schedule', prog_a_reso=self.resos[prog_si], prog_si=prog_si, prog_wp=prog_wp, step=g_it)
         
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
+        self.var_wo_ddp.prog_train_si = self.vae_local.quantize.prog_si = -1
         return grad_norm, scale_log2
     
     def get_config(self):

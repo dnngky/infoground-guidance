@@ -1,3 +1,5 @@
+# pylint: skip-file
+
 import gc
 import os
 import shutil

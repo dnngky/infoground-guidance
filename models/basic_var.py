@@ -1,3 +1,5 @@
+# pylint: skip-file
+
 import math
 
 import torch
@@ -31,7 +33,14 @@ except ImportError:
 
 
 class FFN(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0., fused_if_available=True):
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        drop=0.,
+        fused_if_available=True
+    ):
         super().__init__()
         self.fused_mlp_func = fused_mlp_func if fused_if_available else None
         out_features = out_features or in_features
@@ -57,8 +66,14 @@ class FFN(nn.Module):
 
 class SelfAttention(nn.Module):
     def __init__(
-        self, block_idx, embed_dim=768, num_heads=12,
-        attn_drop=0., proj_drop=0., attn_l2_norm=False, flash_if_available=True,
+        self,
+        block_idx,
+        embed_dim=768,
+        num_heads=12,
+        attn_drop=0.,
+        proj_drop=0.,
+        attn_l2_norm=False,
+        flash_if_available=True,
     ):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -84,7 +99,8 @@ class SelfAttention(nn.Module):
         # only used during inference
         self.caching, self.cached_k, self.cached_v = False, None, None
     
-    def kv_caching(self, enable: bool): self.caching, self.cached_k, self.cached_v = enable, None, None
+    def kv_caching(self, enable: bool):
+        self.caching, self.cached_k, self.cached_v = enable, None, None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
     def forward(self, x, attn_bias):
@@ -127,9 +143,21 @@ class SelfAttention(nn.Module):
 
 class AdaLNSelfAttn(nn.Module):
     def __init__(
-        self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
-        num_heads, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., attn_l2_norm=False,
-        flash_if_available=False, fused_if_available=True,
+        self,
+        block_idx,
+        last_drop_p,
+        embed_dim,
+        cond_dim,
+        shared_aln: bool,
+        norm_layer,
+        num_heads,
+        mlp_ratio=4.,
+        drop=0.,
+        attn_drop=0.,
+        drop_path=0.,
+        attn_l2_norm=False,
+        flash_if_available=False,
+        fused_if_available=True,
     ):
         super(AdaLNSelfAttn, self).__init__()
         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
@@ -149,7 +177,7 @@ class AdaLNSelfAttn(nn.Module):
         self.fused_add_norm_fn = None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
-    def forward(self, x, cond_BD, attn_bias):   # C: embed_dim, D: cond_dim
+    def forward(self, x: torch.Tensor, cond_BD: torch.Tensor, attn_bias: torch.Tensor):   # C: embed_dim, D: cond_dim
         if self.shared_aln:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
         else:

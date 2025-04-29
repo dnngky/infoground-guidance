@@ -1,3 +1,5 @@
+# pylint: skip-file
+
 import datetime
 import functools
 import os

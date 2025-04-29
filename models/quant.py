@@ -1,3 +1,5 @@
+# pylint: skip-file
+
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
