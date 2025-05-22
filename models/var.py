@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as func
@@ -100,8 +100,8 @@ class VAR(nn.Module):
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
         print(
             f'\n[constructor]  ==== flash_if_available={flash_if_available} ({sum(b.attn.using_flash for b in self.blocks)}/{self.depth}), fused_if_available={fused_if_available} (fusing_add_ln={sum(fused_add_norm_fns)}/{self.depth}, fusing_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.blocks)}/{self.depth}) ==== \n'
-            f'    [VAR config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}\n'
-            f'    [drop ratios ] drop_rate={drop_rate}, attn_drop_rate={attn_drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
+            f'     [VAR config] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}\n'
+            f'    [drop ratios] drop_rate={drop_rate}, attn_drop_rate={attn_drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
             end='\n\n', flush=True
         )
         
@@ -118,7 +118,7 @@ class VAR(nn.Module):
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
-    def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]) -> torch.Tensor:
+    def get_logits(self, h_or_h_and_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor], cond_BD: Optional[torch.Tensor]) -> torch.Tensor:
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual   # fused_add_norm must be used
             h = resi + self.blocks[-1].drop_path(h)
@@ -130,29 +130,48 @@ class VAR(nn.Module):
     def autoregressive_infer_cfg(
         self,
         B: int,
-        label_B: Optional[Union[int, torch.LongTensor]],
+        label_B: Optional[int | torch.LongTensor],
         g_seed: Optional[int] = None,
-        cfg: int | float | list[torch.Tensor] = 1.5,
+        w_cfg: Optional[float] = None,
+        w_igg: Optional[float] = None,
         top_k: int = 0,
-        top_p: float = 0.0,
-        use_attn: bool = False,
+        top_p: float = 0.,
         more_smooth: bool = False,
         return_all_scales: bool = False
-    ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
+    ) -> torch.Tensor | tuple[list[torch.Tensor]]:
         """
         only used for inference, on autoregressive mode
 
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param use_attn: perform self-attention on logits
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :param return_all_scales: return the image produced at every scale
+        :param B: Batch size
+        :type B: int
 
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+        :param label_B: Imagenet label (if None, randomly sampled)
+        :type label_B: Optional[int | LongTensor]
+
+        :param g_seed: Random seed
+        :type g_seed: int
+
+        :param w_cfg: Classifier-free guidance rate (disable if None)
+        :type w_cfg: float | None
+
+        :param w_igg: Information-grounding guidance rate (disable if None)
+        :type w_igg: float | None
+
+        :param top_k: Top-k sampling rate
+        :type top_k: int
+
+        :param top_p: Top-p sampling rate
+        :type top_p: float
+
+        :param more_smooth: Smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :type more_smooth: bool
+
+        :param return_all_scales: Whether to return the image produced at every scale
+        :type return_all_scales: bool
+
+        :return: Embeddings h_BChw := vae_embed(idx_Bl). If return_all_scales is True, the embeddings and attention values at
+        every scale are returned.
+        :rtype: Tensor | tuple[list[Tensor]]
         """
         if g_seed is None:
             rng = None
@@ -175,14 +194,17 @@ class VAR(nn.Module):
         
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        
-        imgs = [] # image at different scales
+
+        imgs = [] # images
+        nudges = [] # nudges
+        self_atns = []
+        cross_atns = [torch.zeros((1, 1))]
         
         # Enable kv-caching
         for b in self.blocks:
             b.attn.kv_caching(True)
         
-        # prev_nudge_logits = None
+        prev_nudge_logits = None
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
 
             cur_L += pn**2
@@ -198,40 +220,28 @@ class VAR(nn.Module):
             nudge_logits = cond_logits - uncond_logits
             ratio = si / self.num_stages_minus_1
 
-            if use_attn:
-                # Self-attention
-                nudge_logits = func.scaled_dot_product_attention(
-                    query=nudge_logits,
-                    key=nudge_logits,
-                    value=nudge_logits,
-                )
-                # Cross-attention
-                # if si > 0:
-                #     cross_logits = func.scaled_dot_product_attention(
-                #         query=nudge_logits,
-                #         key=prev_nudge_logits,
-                #         value=prev_nudge_logits
-                #     )
-                #     nudge_logits += ratio * cross_logits
-                # prev_nudge_logits = nudge_logits
+            # Compute adjusted nudges
+            ground_logits = func.scaled_dot_product_attention(
+                query=nudge_logits,
+                key=nudge_logits,
+                value=nudge_logits,
+            )
 
-            if isinstance(cfg, (int, float)):
-                t = ratio * cfg
-                w = 1 + t
-                """
-                logits_BlV = (1 + t) * cond_logits - t * uncond_logits
-                           = w * cond_logits - (w - 1) * uncond_logits
-                           = w * cond_logits - w * uncond_logits + uncond_logits
-                           = uncond_logits + w * (cond_logits - uncond_logits)
-                """
-                logits_BlV = uncond_logits + w * nudge_logits
-            else:
-                # custom guidance
-                w = cfg[si].to(logits_BlV.get_device())
-                logits_BlV = uncond_logits + w @ nudge_logits
+            # Information-grounding guidance
+            t_cfg = 0 if w_cfg is None else 1 + ratio * w_cfg
+            t_igg = 0 if w_igg is None else 1 + ratio * w_igg
+            nudge = t_cfg * nudge_logits + t_igg * ground_logits
+            logits_BlV = uncond_logits + nudge
+
+            nudges.append(nudge.max(dim=2, keepdim=True).values.squeeze(dim=0).cpu())
+            self_atns.append((func.softmax(nudge_logits @ nudge_logits.transpose(1, 2), dim=2) / math.sqrt(self.V)).squeeze(dim=0).cpu())
+            if si > 0:
+                cross_atns.append((func.softmax(nudge_logits @ prev_nudge_logits.transpose(1, 2), dim=2) / math.sqrt(self.V)).squeeze(dim=0).cpu())
+            prev_nudge_logits = nudge_logits
 
             # print(f"{w_ll.shape = }, {logits_BlV.shape[1:] = }")
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            
             # print(f"{idx_Bl.shape = }")
             if not more_smooth: # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
@@ -244,7 +254,7 @@ class VAR(nn.Module):
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, len(self.patch_nums), f_hat, h_BChw
             )
-            imgs.append(self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)) # de-normalize, from [-1, 1] to [0, 1]
+            imgs.append(self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5).squeeze().cpu()) # de-normalize, from [-1, 1] to [0, 1]
             # print(f"{next_token_map.shape = }")
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
@@ -257,7 +267,7 @@ class VAR(nn.Module):
         
         if not return_all_scales:
             return imgs[-1] # return final image only
-        return torch.stack(imgs).squeeze()
+        return imgs, nudges, self_atns, cross_atns
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
