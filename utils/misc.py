@@ -374,6 +374,6 @@ def create_npz_from_sample_folder(sample_folder: str):
     assert samples.shape == (50_000, samples.shape[1], samples.shape[2], 3)
     npz_path = f'{sample_folder}.npz'
     print('Saving .npz file...')
-    np.savez(f'{sample_folder}_1.npz', arr_0=samples)
+    np.savez(f'{sample_folder}.npz', arr_0=samples)
     print(f'Saved .npz file to {npz_path} [shape={samples.shape}].')
     return npz_path

@@ -197,6 +197,7 @@ class VAR(nn.Module):
 
         imgs = [] # images
         nudges = [] # nudges
+        nudge_scores = []
         self_atns = []
         cross_atns = [torch.zeros((1, 1))]
         
@@ -233,7 +234,12 @@ class VAR(nn.Module):
             nudge = t_cfg * nudge_logits + t_igg * ground_logits
             logits_BlV = uncond_logits + nudge
 
-            nudges.append(nudge.max(dim=2, keepdim=True).values.squeeze(dim=0).cpu())
+            nudge_peaks = nudge.max(dim=2, keepdim=True).values
+            nudge_mean_peak = nudge_peaks.mean().item()
+            nudge_score = torch.sum((nudge_peaks - nudge_mean_peak) ** 2) / (nudge_peaks.shape[1] - 1) / nudge_mean_peak
+
+            nudge_scores.append(nudge_score.item())
+            nudges.append(nudge_peaks.squeeze(dim=0).cpu())
             self_atns.append((func.softmax(nudge_logits @ nudge_logits.transpose(1, 2), dim=2) / math.sqrt(self.V)).squeeze(dim=0).cpu())
             if si > 0:
                 cross_atns.append((func.softmax(nudge_logits @ prev_nudge_logits.transpose(1, 2), dim=2) / math.sqrt(self.V)).squeeze(dim=0).cpu())
@@ -267,7 +273,7 @@ class VAR(nn.Module):
         
         if not return_all_scales:
             return imgs[-1] # return final image only
-        return imgs, nudges, self_atns, cross_atns
+        return imgs, nudges, nudge_scores, self_atns, cross_atns
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """

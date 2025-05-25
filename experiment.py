@@ -1,9 +1,8 @@
 # pylint: disable=invalid-name
 # pylint: disable=redefined-outer-name
 # pylint: disable=unspecified-encoding
-
 """
-Evaluation on attention-based guidance.
+Experiment script.
 """
 import json
 import os
@@ -23,7 +22,7 @@ from models import build_vae_var, VAR
 setattr(torch.nn.Linear, 'reset_parameters', lambda _: None)
 setattr(torch.nn.LayerNorm, 'reset_parameters', lambda _: None)
 
-DEVICE = "cuda"
+DEVICE = "cuda:0"
 
 # allow 32-bit matmul to reduce GPU memory overhead
 USE_TF32 = True
@@ -60,6 +59,9 @@ def load_model(depth: int) -> VAR:
     if depth not in DEPTHS:
         raise ValueError("Invalid depth")
 
+    if not os.path.exists("./state_dicts"):
+        os.makedirs("./state_dicts", exist_ok=False)
+
     hf_home = "https://huggingface.co/FoundationVision/var/resolve/main"
     vae_ckpt = "state_dicts/vae_ch160v4096z32.pth"
     var_ckpt = f"state_dicts/var_d{depth}.pth"
@@ -82,8 +84,8 @@ def load_model(depth: int) -> VAR:
     )
 
     # load checkpoints
-    vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-    var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
+    vae.load_state_dict(torch.load(vae_ckpt, map_location="cpu"), strict=True)
+    var.load_state_dict(torch.load(var_ckpt, map_location="cpu"), strict=True)
     vae.eval()
     var.eval()
     for param in vae.parameters():

@@ -1,5 +1,7 @@
 # pylint: skip-file
-
+"""
+NOTE: This script was taken, with slight modifications, from https://github.com/openai/guided-diffusion/blob/main/evaluations/evaluator.py.
+"""
 import argparse
 import io
 import os
@@ -652,4 +654,6 @@ def _numpy_partition(arr, kth, **kwargs):
 
 
 if __name__ == "__main__":
+    if not os.path.exists("./state_dicts"):
+        os.makedirs("./state_dicts", exist_ok=False)
     main()
